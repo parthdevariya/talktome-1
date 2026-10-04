@@ -1,6 +1,6 @@
 // Voice Orb service worker: makes the app installable and lets it open offline.
 // The AI model files themselves are cached separately by WebLLM.
-const CACHE = "voice-orb-v1";
+const CACHE = "voice-orb-v2";
 const SHELL = ["./", "./index.html", "./manifest.webmanifest", "./icon-192.png", "./icon-512.png", "./apple-touch-icon.png"];
 
 self.addEventListener("install", e => {
@@ -23,7 +23,15 @@ self.addEventListener("fetch", e => {
   const cdn = url.hostname === "cdn.jsdelivr.net" || url.hostname.endsWith("fonts.googleapis.com") || url.hostname.endsWith("fonts.gstatic.com");
   if (!sameOrigin && !cdn) return; // model downloads and AI APIs pass straight through
 
-  // Stale-while-revalidate: answer from cache instantly, refresh in the background.
+  // The page itself: network first, so a new deploy shows up on the next open; cache when offline.
+  if (req.mode === "navigate") {
+    e.respondWith(
+      fetch(req).then(res => { if (res.ok) { const copy = res.clone(); caches.open(CACHE).then(c => c.put("./index.html", copy)); } return res; })
+        .catch(() => caches.match("./index.html"))
+    );
+    return;
+  }
+  // Everything else: stale-while-revalidate (answer from cache instantly, refresh in the background).
   e.respondWith(
     caches.open(CACHE).then(async cache => {
       const cached = await cache.match(req, { ignoreSearch: sameOrigin });

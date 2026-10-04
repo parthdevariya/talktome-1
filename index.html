@@ -139,7 +139,6 @@ details summary{cursor:pointer;color:var(--muted);font-size:13px;padding:8px 0}
     <div class="field"><label for="rate">Speed <output id="rateOut">1.0×</output></label><input type="range" id="rate" min="0.6" max="1.6" step="0.1" value="1"></div>
     <div class="field"><label for="pitch">Pitch <output id="pitchOut">1.0</output></label><input type="range" id="pitch" min="0.5" max="1.6" step="0.1" value="1"></div>
   </div>
-  <label class="check"><input type="checkbox" id="handsfree"> Keep listening after each reply</label>
   <div class="row"><button class="btn ghost" id="testVoice" type="button">Test this voice</button></div>
 
   <div class="sec">AI brain</div>
@@ -250,12 +249,12 @@ const synth=window.speechSynthesis;
 const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
 
 let mode="idle", ctl=null, rec=null, turns=[];
+let convo=false, silentCount=0;   // convo: true from Speak until End
 let queue=[], pending="", spokenUpTo=0, streamDone=false, speakingNow=false, energy=0;
 
 LANGS.forEach(([c,n])=>langSel.add(new Option(n,c)));
 langSel.value=load("vo.lang","en-IN");
 rate.value=load("vo.rate","1"); pitch.value=load("vo.pitch","1");
-$("handsfree").checked=load("vo.hf","0")==="1";
 const showVals=()=>{$("rateOut").textContent=(+rate.value).toFixed(1)+"×";$("pitchOut").textContent=(+pitch.value).toFixed(1)};
 showVals();
 
@@ -294,7 +293,6 @@ langSel.onchange=()=>{save("vo.lang",langSel.value);fillVoices()};
 voiceSel.onchange=()=>save("vo.v2.voice."+langSel.value,voiceSel.value);
 rate.oninput=()=>{save("vo.rate",rate.value);showVals()};
 pitch.oninput=()=>{save("vo.pitch",pitch.value);showVals()};
-$("handsfree").onchange=e=>save("vo.hf",e.target.checked?"1":"0");
 $("testVoice").onclick=()=>{stopAll();queue=[sampleLine()];streamDone=true;spokenUpTo=0;setMode("speaking");pump()};
 function sampleLine(){
   const m={hi:"नमस्ते! मैं ऐसे बोलती हूँ।",gu:"નમસ્તે! હું આ રીતે બોલું છું.",mr:"नमस्कार! मी असं बोलते.",bn:"নমস্কার! আমি এভাবে কথা বলি।",ta:"வணக்கம்! நான் இப்படித்தான் பேசுவேன்.",te:"నమస్కారం! నేను ఇలా మాట్లాడతాను.",es:"¡Hola! Así es como sueno.",fr:"Bonjour ! Voici ma voix.",de:"Hallo! So klinge ich.",ja:"こんにちは。私はこんな声です。",zh:"你好！这是我的声音。",ko:"안녕하세요! 제 목소리예요.",ar:"مرحبا! هذا هو صوتي.",ru:"Привет! Вот так звучит мой голос."};
@@ -429,9 +427,9 @@ let wake=null;
 function setMode(m){
   mode=m;
   stateEl.textContent={idle:"Ready",listening:"Listening…",thinking:"Thinking…",speaking:"Speaking"}[m];
-  const busy=m!=="idle";
+  const busy=m!=="idle"||convo;
   speakBtn.dataset.mode=busy?"stop":"speak";
-  speakLabel.textContent=m==="listening"?"Done":busy?"Stop":"Speak";
+  speakLabel.textContent=convo?"End":busy?"Stop":"Speak";
   if(busy && !wake && navigator.wakeLock) navigator.wakeLock.request("screen").then(w=>{wake=w;w.onrelease=()=>wake=null}).catch(()=>{});
   if(!busy && wake){ wake.release().catch(()=>{}); wake=null; }
 }
@@ -439,35 +437,63 @@ function setMode(m){
 /* ---------- listening ---------- */
 let micBroken=!SR;
 if(micBroken) hint.textContent="Voice input isn't supported in this browser. Type below instead; replies are still spoken.";
-speakBtn.onclick=()=>{
-  if(mode==="listening"){ rec&&rec.stop(); return; }
-  if(mode!=="idle"){ stopAll(); setMode("idle"); return; }
+function startConvo(){
   primeAudio();
   if(micBroken){ $("typeInput").focus(); noteEl.textContent="Microphone isn't available. Type your message and tap Send."; return; }
+  convo=true; silentCount=0; noteEl.textContent="";
   listen();
+}
+function endConvo(){
+  convo=false; stopAll(); setMode("idle");
+  stateEl.textContent="Conversation ended";
+}
+speakBtn.onclick=()=>{
+  if(convo){ endConvo(); return; }
+  if(mode!=="idle"){ stopAll(); setMode("idle"); return; }
+  startConvo();
 };
+// tap the orb: start talking, or interrupt the reply and go straight back to listening
+function interrupt(){
+  stopAll(); noteEl.textContent="";
+  if(convo){ setMode("idle"); listen(); } else setMode("idle");
+}
 function listen(){
-  noteEl.textContent=""; youEl.textContent="";
+  if(rec) return;
+  youEl.textContent="";
   rec=new SR(); rec.lang=langSel.value; rec.interimResults=true; rec.continuous=false;
   let finalText="";
   rec.onresult=e=>{
     let interim="";
     for(const r of e.results){ if(r.isFinal) finalText=r[0].transcript; else interim+=r[0].transcript; }
     youEl.textContent=finalText||interim; energy=Math.min(1,energy+.25);
+    if(finalText||interim) noteEl.textContent="";
   };
+  let fatal=false;
   rec.onerror=e=>{
     if(["not-allowed","service-not-allowed","audio-capture"].includes(e.error)){
-      noteEl.textContent="Microphone permission is off. Allow it in your browser's site settings, or type below.";
-    } else if(e.error==="no-speech") noteEl.textContent="I didn't hear anything. Tap Speak and try again.";
-    else if(e.error==="language-not-supported") noteEl.textContent="Voice input doesn't support "+langSel.selectedOptions[0].text+" on this device. Type instead.";
-    else if(e.error==="network") noteEl.textContent="Voice input needs an internet connection on this device. Type instead while offline.";
+      fatal=true; noteEl.textContent="Microphone permission is off. Allow it in your browser's site settings, or type below.";
+    } else if(e.error==="language-not-supported"){ fatal=true; noteEl.textContent="Voice input doesn't support "+langSel.selectedOptions[0].text+" on this device. Type instead."; }
+    else if(e.error==="network"){ fatal=true; noteEl.textContent="Voice input needs an internet connection on this device. Type instead while offline."; }
   };
-  rec.onend=()=>{ rec=null; const t=(finalText||youEl.textContent).trim(); if(t && mode==="listening") ask(t); else if(mode==="listening") setMode("idle"); };
-  try{ rec.start(); setMode("listening"); }catch{ noteEl.textContent="Couldn't start the microphone. Type instead."; }
+  rec.onend=()=>{
+    rec=null;
+    if(mode!=="listening") return;                 // stopped or interrupted elsewhere
+    const t=(finalText||youEl.textContent).trim();
+    if(t){ silentCount=0; ask(t); return; }
+    if(convo && !fatal){
+      // nothing heard: keep the conversation open, but pause after about a minute of silence to save battery
+      if(++silentCount>=8){ convo=false; setMode("idle"); stateEl.textContent="Paused"; noteEl.textContent="Paused after a minute of silence. Tap Speak to continue."; return; }
+      setTimeout(()=>{ if(convo && mode==="listening") listen(); },250);
+      return;
+    }
+    convo=false; setMode("idle");
+  };
+  try{ rec.start(); setMode("listening"); }
+  catch{ rec=null; convo=false; setMode("idle"); noteEl.textContent="Couldn't start the microphone. Type instead."; }
 }
 $("typeForm").addEventListener("submit",e=>{
   e.preventDefault(); const t=$("typeInput").value.trim(); if(!t) return;
-  $("typeInput").value=""; $("typeInput").blur(); primeAudio(); stopAll(); noteEl.textContent=""; youEl.textContent=t; ask(t);
+  $("typeInput").value=""; $("typeInput").blur(); primeAudio(); stopAll(); setMode("idle"); noteEl.textContent=""; youEl.textContent=t; ask(t);
 });
 
 /* ---------- thinking ---------- */
@@ -485,7 +511,7 @@ function showError(e){
   $("bar").hidden=true;
 }
 async function ask(text){
-  if(provSel.value!=="local" && !keyIn.value.trim()){ noteEl.textContent="Add your API key in Settings first."; openSheet("settings"); setMode("idle"); return; }
+  if(provSel.value!=="local" && !keyIn.value.trim()){ convo=false; noteEl.textContent="Add your API key in Settings first."; openSheet("settings"); setMode("idle"); return; }
   turns.push({role:"user",content:text});
   if(turns.length>(provSel.value==="local"?8:20)) turns=turns.slice(-(provSel.value==="local"?8:20));
   while(turns.length && turns[0].role!=="user") turns.shift();
@@ -501,6 +527,7 @@ async function ask(text){
     streamDone=true;
     if(e.name==="AbortError") return;
     turns.pop(); showError(e);
+    convo=false;
     if(!speakingNow && !queue.length) setMode("idle");
   }
 }
@@ -536,11 +563,11 @@ function pump(){
 }
 function finishTurn(){
   clearInterval(keepAlive); setMode("idle");
-  if($("handsfree").checked && !micBroken) setTimeout(()=>{ if(mode==="idle") listen(); },400);
+  if(convo && !micBroken) setTimeout(()=>{ if(convo && mode==="idle") listen(); },350);  // small gap so the mic doesn't catch the voice's tail
 }
 function stopAll(){
   ctl&&ctl.abort(); ctl=null;
-  rec&&rec.abort(); rec=null;
+  if(rec){ const r=rec; rec=null; r.onend=null; r.abort(); }
   queue=[]; pending=""; streamDone=true; speakingNow=false;
   synth&&synth.cancel(); clearInterval(keepAlive);
 }
@@ -592,11 +619,15 @@ function frame(now){
 }
 requestAnimationFrame(frame);
 // tapping the orb works like the Speak button
-cv.addEventListener("click",()=>speakBtn.click());
+cv.addEventListener("click",()=>{
+  if(mode==="speaking"||mode==="thinking") interrupt();
+  else if(!convo && mode==="idle") startConvo();
+});
 setMode("idle");
 replyEl.textContent = provSel.value==="local"
-  ? "Tap Speak and say anything. The first reply takes a little longer while the AI downloads to this device."
-  : "Tap Speak and say anything.";
+  ? "Tap Speak once and just talk. It keeps listening until you tap End. The first reply takes longer while the AI downloads."
+  : "Tap Speak once and just talk. It keeps listening until you tap End.";
+hint.textContent=hint.textContent||"Tip: tap the orb to interrupt while it's talking.";
 </script>
 </body>
 </html>
