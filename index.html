@@ -141,6 +141,23 @@ details summary{cursor:pointer;color:var(--muted);font-size:13px;padding:8px 0}
   </div>
   <div class="row"><button class="btn ghost" id="testVoice" type="button">Test this voice</button></div>
 
+  <div class="sec">Voice recognition</div>
+  <div class="grid">
+    <div class="field"><label for="sttMode">Hearing you</label>
+      <select id="sttMode">
+        <option value="auto">Auto: built-in online, on-device offline</option>
+        <option value="device">Always on-device (works offline)</option>
+        <option value="builtin">Always built-in (may need internet)</option>
+      </select></div>
+    <div class="field"><label for="sttModel">On-device recognition model</label>
+      <select id="sttModel">
+        <option value="onnx-community/whisper-base" data-mb="80">Standard · Whisper Base (~80 MB)</option>
+        <option value="onnx-community/whisper-small" data-mb="250">Better Indian languages · Whisper Small (~250 MB)</option>
+        <option value="onnx-community/whisper-tiny" data-mb="40">Lightest · Whisper Tiny (~40 MB)</option>
+      </select></div>
+  </div>
+  <p class="tip" id="sttTip">On-device recognition downloads once, then understands you with no internet.</p>
+
   <div class="sec">AI brain</div>
   <div class="grid">
     <div class="field"><label for="provider">Runs on</label>
@@ -164,7 +181,7 @@ details summary{cursor:pointer;color:var(--muted);font-size:13px;padding:8px 0}
   <p class="tip" id="keyTip"></p>
   <p class="tip warn" id="gpuTip" hidden></p>
   <div class="row">
-    <button class="btn ghost" id="preload" type="button">Download model now</button>
+    <button class="btn ghost" id="preload" type="button">Download for offline use</button>
     <button class="btn" id="setDone" type="button">Done</button>
   </div>
 </section>
@@ -315,7 +332,7 @@ function showProvider(){
   const p=provSel.value, local=p==="local";
   keyIn.value=load("vo.key."+p,"");
   modelIn.value=load("vo.model."+p,PROVIDERS[p].model);
-  $("localField").hidden=!local; $("preload").hidden=!local;
+  $("localField").hidden=!local;
   $("keyField").hidden=local; $("modelField").hidden=local;
   $("keyTip").textContent=PROVIDERS[p].tip+(local?"":" Your key stays on this device only.");
 }
@@ -367,10 +384,14 @@ async function getEngine(){
   try{ return await loading; } finally { loading=null; }
 }
 $("preload").onclick=async()=>{
-  closeSheet("settings"); setMode("thinking");
-  try{ await getEngine(); replyEl.textContent="The AI is ready. Press Speak."; }
-  catch(e){ showError(e); }
-  setMode("idle");
+  closeSheet("settings"); stopAll(); convo=false; setMode("thinking");
+  try{
+    if(canRecord) await getASR();
+    if(provSel.value==="local") await getEngine();
+    replyEl.textContent = provSel.value==="local" ? "Everything is downloaded. Voice Orb now works without internet." : "Voice recognition is downloaded and works offline. The AI brain still needs internet while you're using an API key.";
+    noteEl.textContent="";
+  }catch(e){ showError(e); }
+  $("bar").hidden=true; setMode("idle");
 };
 
 async function streamLocal({system,turns,signal,onText}){
@@ -427,6 +448,7 @@ let wake=null;
 function setMode(m){
   mode=m;
   stateEl.textContent={idle:"Ready",listening:"Listening…",thinking:"Thinking…",speaking:"Speaking"}[m];
+  if(m==="speaking"||m==="thinking") capture=null;
   const busy=m!=="idle"||convo;
   speakBtn.dataset.mode=busy?"stop":"speak";
   speakLabel.textContent=convo?"End":busy?"Stop":"Speak";
@@ -435,8 +457,24 @@ function setMode(m){
 }
 
 /* ---------- listening ---------- */
-let micBroken=!SR;
+const canRecord=!!(navigator.mediaDevices&&navigator.mediaDevices.getUserMedia);
+let micBroken=!SR && !canRecord;
 if(micBroken) hint.textContent="Voice input isn't supported in this browser. Type below instead; replies are still spoken.";
+const sttSel=$("sttMode"), sttModelSel=$("sttModel");
+sttSel.value=load("vo.stt", SR?"auto":"device");
+sttModelSel.value=load("vo.sttModel","onnx-community/whisper-base");
+sttSel.onchange=()=>save("vo.stt",sttSel.value);
+sttModelSel.onchange=()=>{save("vo.sttModel",sttModelSel.value); asr=null; asrModel="";};
+if(!SR){ sttSel.querySelector('[value=builtin]').disabled=true; sttSel.querySelector('[value=auto]').disabled=true; sttSel.value="device"; }
+let builtinFailed=false;   // built-in recogniser hit a network error this session → use on-device
+function useDevice(){
+  if(!SR) return true;
+  if(sttSel.value==="device") return true;
+  if(sttSel.value==="builtin") return false;
+  return builtinFailed || !navigator.onLine;
+}
+window.addEventListener("online",()=>{ builtinFailed=false; });
+
 function startConvo(){
   primeAudio();
   if(micBroken){ $("typeInput").focus(); noteEl.textContent="Microphone isn't available. Type your message and tap Send."; return; }
@@ -444,7 +482,7 @@ function startConvo(){
   listen();
 }
 function endConvo(){
-  convo=false; stopAll(); setMode("idle");
+  convo=false; stopAll(); releaseMic(); setMode("idle");
   stateEl.textContent="Conversation ended";
 }
 speakBtn.onclick=()=>{
@@ -460,37 +498,153 @@ function interrupt(){
 function listen(){
   if(rec) return;
   youEl.textContent="";
+  if(useDevice()) listenDevice(); else listenBuiltin();
+}
+// shared ending for both recognisers
+function heard(text,{fatal=false}={}){
+  if(mode!=="listening") return;                 // stopped or interrupted elsewhere
+  const t=(text||"").trim();
+  if(t){ silentCount=0; youEl.textContent=t; ask(t); return; }
+  if(convo && !fatal){
+    // nothing heard: keep the conversation open, but pause after about a minute of silence to save battery
+    if(++silentCount>=8){ convo=false; releaseMic(); setMode("idle"); stateEl.textContent="Paused"; noteEl.textContent="Paused after a minute of silence. Tap Speak to continue."; return; }
+    setTimeout(()=>{ if(convo && mode==="listening" && !rec) listen(); },250);
+    return;
+  }
+  convo=false; releaseMic(); setMode("idle");
+}
+
+/* built-in browser recognition (fast; on many phones it needs internet) */
+function listenBuiltin(){
   rec=new SR(); rec.lang=langSel.value; rec.interimResults=true; rec.continuous=false;
-  let finalText="";
+  let finalText="", fatal=false, switchToDevice=false;
   rec.onresult=e=>{
     let interim="";
     for(const r of e.results){ if(r.isFinal) finalText=r[0].transcript; else interim+=r[0].transcript; }
     youEl.textContent=finalText||interim; energy=Math.min(1,energy+.25);
     if(finalText||interim) noteEl.textContent="";
   };
-  let fatal=false;
   rec.onerror=e=>{
-    if(["not-allowed","service-not-allowed","audio-capture"].includes(e.error)){
-      fatal=true; noteEl.textContent="Microphone permission is off. Allow it in your browser's site settings, or type below.";
-    } else if(e.error==="language-not-supported"){ fatal=true; noteEl.textContent="Voice input doesn't support "+langSel.selectedOptions[0].text+" on this device. Type instead."; }
-    else if(e.error==="network"){ fatal=true; noteEl.textContent="Voice input needs an internet connection on this device. Type instead while offline."; }
+    if(e.error==="network"){ builtinFailed=true; if(sttSel.value==="auto"){ switchToDevice=true; noteEl.textContent="No internet. Switching to on-device voice recognition…"; } else { fatal=true; noteEl.textContent="Built-in voice input needs internet. Choose on-device recognition in Settings to use it offline."; } }
+    else if(["not-allowed","service-not-allowed","audio-capture"].includes(e.error)){ fatal=true; noteEl.textContent="Microphone permission is off. Allow it in your browser's site settings, or type below."; }
+    else if(e.error==="language-not-supported"){
+      if(sttSel.value==="auto"){ builtinFailed=true; switchToDevice=true; } else { fatal=true; noteEl.textContent="Built-in voice input doesn't support "+langSel.selectedOptions[0].text+" here. Choose on-device recognition in Settings."; }
+    }
   };
   rec.onend=()=>{
     rec=null;
-    if(mode!=="listening") return;                 // stopped or interrupted elsewhere
-    const t=(finalText||youEl.textContent).trim();
-    if(t){ silentCount=0; ask(t); return; }
-    if(convo && !fatal){
-      // nothing heard: keep the conversation open, but pause after about a minute of silence to save battery
-      if(++silentCount>=8){ convo=false; setMode("idle"); stateEl.textContent="Paused"; noteEl.textContent="Paused after a minute of silence. Tap Speak to continue."; return; }
-      setTimeout(()=>{ if(convo && mode==="listening") listen(); },250);
-      return;
-    }
-    convo=false; setMode("idle");
+    if(switchToDevice && mode==="listening"){ listenDevice(); return; }
+    heard(finalText||youEl.textContent,{fatal});
   };
   try{ rec.start(); setMode("listening"); }
-  catch{ rec=null; convo=false; setMode("idle"); noteEl.textContent="Couldn't start the microphone. Type instead."; }
+  catch{ rec=null; if(canRecord){ setMode("listening"); listenDevice(); } else { convo=false; setMode("idle"); noteEl.textContent="Couldn't start the microphone. Type instead."; } }
 }
+
+/* on-device recognition: record with the mic, detect when you stop talking, transcribe with Whisper (works offline) */
+let asr=null, asrModel="", asrLoading=null, tf=null;
+let micStream=null, audioCtx=null, micNode=null, capture=null;
+async function getASR(){
+  const id=sttModelSel.value;
+  if(asr && asrModel===id) return asr;
+  if(asrLoading) return asrLoading;
+  asrLoading=(async()=>{
+    tf=tf||await import("https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.3.0/+esm");
+    tf.env.allowLocalModels=false;
+    const mb=+sttModelSel.selectedOptions[0].dataset.mb; const files={};
+    const pipe=await tf.pipeline("automatic-speech-recognition",id,{
+      dtype:"q8", device:"wasm",
+      progress_callback:x=>{
+        if(x.status!=="progress"||!x.total) return;
+        files[x.file]=[x.loaded,x.total];
+        let l=0,t=0; for(const [a,b] of Object.values(files)){l+=a;t+=b;}
+        const pct=Math.min(100,Math.round(l/t*100));
+        $("bar").hidden=false; $("barFill").style.width=pct+"%";
+        noteEl.textContent=`Downloading voice recognition… ${pct}% of ~${mb} MB (one time only)`;
+      }
+    });
+    asr=pipe; asrModel=id; $("bar").hidden=true;
+    try{ navigator.storage?.persist?.(); }catch{}
+    return pipe;
+  })();
+  try{ return await asrLoading; } finally { asrLoading=null; }
+}
+async function getMic(){
+  if(micStream && micStream.active) return;
+  micStream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true,channelCount:1}});
+  audioCtx=new (window.AudioContext||window.webkitAudioContext)();
+  const src=audioCtx.createMediaStreamSource(micStream);
+  micNode=audioCtx.createScriptProcessor(4096,1,1);
+  micNode.onaudioprocess=e=>{ if(capture) capture(e.inputBuffer.getChannelData(0)); };
+  src.connect(micNode); micNode.connect(audioCtx.destination);   // destination needed for some browsers; output stays silent
+}
+function releaseMic(){
+  capture=null;
+  try{ micNode&&micNode.disconnect(); }catch{}
+  try{ micStream&&micStream.getTracks().forEach(t=>t.stop()); }catch{}
+  try{ audioCtx&&audioCtx.close(); }catch{}
+  micStream=audioCtx=micNode=null;
+}
+function to16k(chunks,rate){
+  let n=0; for(const c of chunks) n+=c.length;
+  const all=new Float32Array(n); let o=0; for(const c of chunks){ all.set(c,o); o+=c.length; }
+  if(rate===16000) return all;
+  const ratio=rate/16000, out=new Float32Array(Math.floor(n/ratio));
+  for(let i=0;i<out.length;i++){ const x=i*ratio, j=Math.floor(x), f=x-j; out[i]=all[j]*(1-f)+(all[j+1]??all[j])*f; }
+  return out;
+}
+async function listenDevice(){
+  setMode("listening");
+  const token={cancelled:false};
+  rec={abort(){ token.cancelled=true; capture=null; }};
+  try{
+    if(!asr || asrModel!==sttModelSel.value){ stateEl.textContent="Loading voice recognition…"; await getASR(); if(mode==="listening") stateEl.textContent="Listening…"; }
+    await getMic();
+    if(audioCtx.state==="suspended") await audioCtx.resume();
+  }catch(e){
+    rec=null; if(token.cancelled) return;
+    const denied=e&&(e.name==="NotAllowedError"||e.name==="SecurityError");
+    noteEl.textContent=denied?"Microphone permission is off. Allow it in your browser's site settings, or type below."
+      : !navigator.onLine?"On-device voice recognition isn't downloaded yet. Connect once and tap Settings → Download for offline use."
+      : "Couldn't start on-device voice recognition ("+(e.message||e)+"). Type below instead.";
+    $("bar").hidden=true; heard("",{fatal:true}); return;
+  }
+  if(token.cancelled) return;
+  // simple voice-activity detection
+  const rate=audioCtx.sampleRate, block=4096/rate;
+  const chunks=[], pre=[]; let speaking=false, speechT=0, silenceT=0, waitT=0, noise=0.01;
+  const done=async(hadSpeech)=>{
+    capture=null;
+    if(token.cancelled) return;
+    if(!hadSpeech){ rec=null; heard(""); return; }
+    stateEl.textContent="Understanding…"; energy=.4;
+    try{
+      const out=await asr(to16k(chunks,rate),{language:langSel.value.split("-")[0],task:"transcribe"});
+      if(token.cancelled) return;
+      rec=null;
+      let text=(out&&out.text||"").replace(/\[[^\]]*\]|\([^)]*\)|♪/g,"").trim();
+      if(/^[\s.,!?…-]*$/.test(text)) text="";
+      heard(text);
+    }catch(e){ rec=null; if(!token.cancelled){ noteEl.textContent="Voice recognition failed: "+(e.message||e); heard("",{fatal:true}); } }
+  };
+  capture=buf=>{
+    const d=new Float32Array(buf); let sum=0; for(let i=0;i<d.length;i++) sum+=d[i]*d[i];
+    const rms=Math.sqrt(sum/d.length);
+    if(!speaking) noise=noise*0.95+Math.min(rms,0.05)*0.05;
+    const thr=Math.max(0.012,noise*2.5);
+    energy=Math.min(1,energy*0.7+rms*12);
+    if(!speaking){
+      pre.push(d); if(pre.length>3) pre.shift();                       // keep ~0.3–0.7 s before speech starts
+      waitT+=block;
+      if(rms>thr){ speaking=true; chunks.push(...pre); chunks.push(d); speechT=block; noteEl.textContent=""; }
+      else if(waitT>8) done(false);                                     // ~8 s with nothing said
+    } else {
+      chunks.push(d); speechT+=block;
+      silenceT = rms>thr*0.8 ? 0 : silenceT+block;
+      if((silenceT>1.0 && speechT>0.5) || speechT>25) done(speechT-silenceT>0.35);   // ~1 s pause ends your turn
+    }
+  };
+}
+
 $("typeForm").addEventListener("submit",e=>{
   e.preventDefault(); const t=$("typeInput").value.trim(); if(!t) return;
   $("typeInput").value=""; $("typeInput").blur(); primeAudio(); stopAll(); setMode("idle"); noteEl.textContent=""; youEl.textContent=t; ask(t);

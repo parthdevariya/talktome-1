@@ -1,6 +1,6 @@
 // Voice Orb service worker: makes the app installable and lets it open offline.
 // The AI model files themselves are cached separately by WebLLM.
-const CACHE = "voice-orb-v2";
+const CACHE = "voice-orb-v3";
 const SHELL = ["./", "./index.html", "./manifest.webmanifest", "./icon-192.png", "./icon-512.png", "./apple-touch-icon.png"];
 
 self.addEventListener("install", e => {

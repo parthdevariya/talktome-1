@@ -32,6 +32,11 @@ WHICH PHONES CAN RUN THE AI ON-DEVICE
   Older phones: choose "Google Gemini" in Settings and paste a free key
   from aistudio.google.com. Everything else works the same.
 
-NOTES
-  Voice typing (speech-to-text) uses your phone's built-in recognition,
-  which may need internet on some phones. Typing always works offline.
+FULLY OFFLINE
+  While online, open Settings and tap "Download for offline use".
+  That downloads the AI brain and on-device voice recognition (Whisper).
+  After that, everything works in flight mode.
+  Voice recognition setting:
+    Auto      built-in recognition when online, on-device when offline (default)
+    On-device always offline, private, works in any language Whisper knows
+    Built-in  your phone's recognition (fastest, may need internet)
